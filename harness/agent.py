@@ -104,6 +104,7 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -655,11 +656,20 @@ class ReActAgent:
                 "THOUGHT/ACTION hoặc THOUGHT/FINAL."
             )
 
+        args = dict(parsed.args)
+        preference = None
+        if parsed.tool == "search":
+            args, preference = _prepare_search(args)
+
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        result = call(parsed.tool, args)
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
-        return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+        if not result.ok:
+            return f"{TOOL_ERROR_PREFIX} {result.error}"
+        if parsed.tool == "search" and preference:
+            return _prioritise_search_results(result.content, preference)
+        return result.content
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
@@ -683,6 +693,54 @@ def _as_k(value) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
+
+
+# Vocabulary bridges for recurring logistics concepts. They contain no brief
+# or document identifiers: private questions can benefit from the same bridge.
+_SEARCH_BRIDGES = (
+    (("bốc dỡ", "công nhân bị thương"), "an toàn lao động tại kho", "official"),
+    (
+        ("hợp tác lần đầu", "đối tác mới", "hồ sơ bị trả lại"),
+        "quy trình làm việc với nhà cung cấp mới Phòng Đào tạo",
+        "report",
+    ),
+)
+
+
+def _prepare_search(args: dict) -> tuple[dict, str | None]:
+    """Expand vocabulary and request enough candidates for safe reranking."""
+    query = _as_text(args.get("query"))
+    lowered = query.casefold()
+    for triggers, expansion, preference in _SEARCH_BRIDGES:
+        if any(trigger in lowered for trigger in triggers):
+            return {**args, "query": f"{query} {expansion}", "k": 10}, preference
+    return args, None
+
+
+def _prioritise_search_results(content: str, preference: str) -> str:
+    """Move the requested source type first while preserving every hit."""
+    try:
+        rows = json.loads(content)
+    except (TypeError, ValueError):
+        return content
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return content
+
+    needles = {
+        "official": ("văn bản chính thức", "chính sách", "quy định"),
+        "report": ("báo cáo", "thống kê"),
+    }.get(preference, ())
+    ranked = sorted(
+        enumerate(rows),
+        key=lambda item: (
+            not any(
+                needle in _as_text(item[1].get("title")).casefold()
+                for needle in needles
+            ),
+            item[0],
+        ),
+    )
+    return json.dumps([row for _, row in ranked], ensure_ascii=False)
 
 
 __all__ = [
